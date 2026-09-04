@@ -1,0 +1,14 @@
+{
+  "mcpServers": {
+    "cloudkit": {
+      "command": "node",
+      "args": ["/absolute/path/to/mcp-cloudkit/dist/cli.js"],
+      "env": {
+        "CLOUDKIT_MANAGEMENT_TOKEN": "...",
+        "CLOUDKIT_TEAM_ID": "...",
+        "CLOUDKIT_CONTAINER_ID": "",
+        "CLOUDKIT_ALLOW_WRITES": ""
+      }
+    }
+  }
+}
