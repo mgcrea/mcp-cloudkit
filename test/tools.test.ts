@@ -1,3 +1,7 @@
+import { mkdtempSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
+
 import { describe, expect, it, vi } from "vitest";
 
 import {
@@ -59,28 +63,109 @@ describe("tool registration matrix", () => {
   });
 });
 
+type FieldSpec = { type?: string; indexes?: ("QUERYABLE" | "SEARCHABLE" | "SORTABLE")[] };
+
+/**
+ * A `GET …/environments/{env}/schema` response, in the shape Apple actually
+ * returns — captured from a live container, not guessed. Fields carry their
+ * indexes as `isQueryable`/`isSearchable`/`isSortable`, and system fields
+ * (`___recordID` and friends) come back alongside the user's own.
+ */
+const schemaResponse = (
+  uuid: string,
+  recordTypes: Record<string, Record<string, FieldSpec>>,
+  textSchema = `DEFINE SCHEMA ${uuid}`,
+) => ({
+  schema: {
+    uuid,
+    createdAt: "2026-09-03T11:21:33.369Z",
+    roles: [{ id: 0, name: "_world", type: "DEFAULT_ROLE" }],
+    textSchema,
+    recordTypes: Object.entries(recordTypes).map(([recordTypeName, fields]) => ({
+      recordTypeName,
+      recordIdType: "STRING",
+      indexes: [],
+      roles: [],
+      fields: [
+        ...Object.entries(fields).map(([name, spec]) => ({
+          name,
+          type: spec.type ?? "stringType",
+          isQueryable: spec.indexes?.includes("QUERYABLE") ?? false,
+          isSearchable: spec.indexes?.includes("SEARCHABLE") ?? false,
+          isSortable: spec.indexes?.includes("SORTABLE") ?? false,
+          isUserCreated: true,
+        })),
+        {
+          name: "___recordID",
+          systemFieldName: "recordName",
+          type: "referenceType",
+          isQueryable: false,
+          isSearchable: false,
+          isSortable: false,
+          isUserCreated: false,
+        },
+      ],
+    })),
+  },
+});
+
+/** Answers each environment's schema read from its own fixture. */
+const schemas = (
+  development: unknown,
+  production: unknown,
+  rest: (url: string, init?: RequestInit) => Response = () => jsonResponse({}),
+) =>
+  vi.fn(async (url: string, init?: RequestInit) => {
+    if (url.endsWith("/environments/DEVELOPMENT/schema")) return jsonResponse(development);
+    if (url.endsWith("/environments/PRODUCTION/schema")) return jsonResponse(production);
+    return rest(url, init);
+  });
+
+const TRACK = { CD_name: { indexes: ["QUERYABLE", "SORTABLE"] } } satisfies Record<
+  string,
+  FieldSpec
+>;
+
 describe("requests", () => {
-  it("authenticates with the management token header, not a bearer token", async () => {
-    const fetchImpl = vi.fn(async () => jsonResponse({ recordTypes: [] }));
-    const harness = await connectConfigured({ CLOUDKIT_CONTAINER_ID: "C" }, fetchImpl);
-    await harness.call("cloudkit_list_record_types", { environment: "DEVELOPMENT" });
+  // Read out of a live cktool session under a debugger: a management token goes
+  // in X-ACP-API-TOKEN. X-Apple-CloudKit-User-Token — the only header name
+  // `strings` finds in the binary — is for *user* tokens, and the API answers
+  // a management token sent there with 401 "Failed to validate user token".
+  it("authenticates with X-ACP-API-TOKEN, not the user-token header", async () => {
+    const fetchImpl = vi.fn(async () => jsonResponse({ containers: [] }));
+    const harness = await connectConfigured({}, fetchImpl);
+    await harness.call("cloudkit_list_containers");
 
     const headers = harness.initAt().headers as Record<string, string>;
-    expect(headers["X-Apple-CloudKit-User-Token"]).toBe("test-token");
+    expect(headers["X-ACP-API-TOKEN"]).toBe("test-token");
+    expect(headers["X-CK-CLIENT"]).toMatch(/^mcp-cloudkit-js\//);
+    expect(headers["X-Apple-CloudKit-User-Token"]).toBeUndefined();
     expect(headers.Authorization).toBeUndefined();
   });
 
-  it("builds the environment-scoped record types path from the configured defaults", async () => {
-    const fetchImpl = vi.fn(async () => jsonResponse({ recordTypes: [] }));
+  it("lists containers from the team route, which sits outside /v1/database", async () => {
+    const fetchImpl = vi.fn(async () =>
+      jsonResponse({ containers: [{ id: "iCloud.io.mgcrea.Balise", teamId: "75QE9PRT3V" }] }),
+    );
+    const harness = await connectConfigured({}, fetchImpl);
+    const body = await harness.call("cloudkit_list_containers");
+
+    expect(harness.urlAt()).toBe("https://api.icloud.apple.com/teams/75QE9PRT3V/containers");
+    expect(body).toMatchObject({ containers: [{ id: "iCloud.io.mgcrea.Balise" }] });
+  });
+
+  it("reads record types from the environment schema, built from the configured defaults", async () => {
+    const fetchImpl = vi.fn(async () => jsonResponse(schemaResponse("dev", { CD_Track: TRACK })));
     const harness = await connectConfigured(
       { CLOUDKIT_CONTAINER_ID: "iCloud.io.mgcrea.Balise" },
       fetchImpl,
     );
     await harness.call("cloudkit_list_record_types", { environment: "DEVELOPMENT" });
 
+    // Not `…/recordTypes`: that route exists, but refuses a management token.
     expect(harness.urlAt()).toBe(
       "https://api.icloud.apple.com/v1/database/teams/75QE9PRT3V/containers/" +
-        "iCloud.io.mgcrea.Balise/environments/DEVELOPMENT/recordTypes",
+        "iCloud.io.mgcrea.Balise/environments/DEVELOPMENT/schema",
     );
   });
 
@@ -91,30 +176,29 @@ describe("requests", () => {
     expect(result.error).toContain("CLOUDKIT_CONTAINER_ID");
   });
 
-  it("shapes record types down to their fields", async () => {
+  it("shapes record types down to their fields, indexes and system flag", async () => {
     const fetchImpl = vi.fn(async () =>
-      jsonResponse({
-        recordTypes: [
-          {
-            name: "CD_Track",
-            fields: [
-              { name: "CD_isHidden", fieldType: "INT64", queryable: true, extra: "dropped" },
-              { name: "CD_name", fieldType: "STRING" },
-            ],
+      jsonResponse(
+        schemaResponse("dev", {
+          CD_Track: {
+            CD_isHidden: { type: "int64Type", indexes: ["QUERYABLE", "SORTABLE"] },
+            CD_notes: {},
           },
-        ],
-      }),
+        }),
+      ),
     );
     const harness = await connectConfigured({ CLOUDKIT_CONTAINER_ID: "C" }, fetchImpl);
     const body = await harness.call("cloudkit_list_record_types", { environment: "DEVELOPMENT" });
 
-    expect(body).toMatchObject({
+    expect(body).toEqual({
+      isToolError: false,
       recordTypes: [
         {
           name: "CD_Track",
           fields: [
-            { name: "CD_isHidden", type: "INT64", queryable: true },
-            { name: "CD_name", type: "STRING" },
+            { name: "CD_isHidden", type: "int64Type", queryable: true, sortable: true },
+            { name: "CD_notes", type: "stringType" },
+            { name: "___recordID", type: "referenceType", system: true },
           ],
         },
       ],
@@ -123,12 +207,7 @@ describe("requests", () => {
 
   it("filters to one record type when asked", async () => {
     const fetchImpl = vi.fn(async () =>
-      jsonResponse({
-        recordTypes: [
-          { name: "CD_Track", fields: [] },
-          { name: "CD_Waypoint", fields: [] },
-        ],
-      }),
+      jsonResponse(schemaResponse("dev", { CD_Track: {}, CD_Waypoint: {} })),
     );
     const harness = await connectConfigured({ CLOUDKIT_CONTAINER_ID: "C" }, fetchImpl);
     const body = (await harness.call("cloudkit_list_record_types", {
@@ -177,22 +256,15 @@ describe("requests", () => {
 });
 
 describe("cloudkit_diff_schema", () => {
-  it("flattens a diff to one row per field change", async () => {
-    const fetchImpl = vi.fn(async () =>
-      jsonResponse({
-        recordTypeChanges: [
-          {
-            recordType: "CD_Track",
-            operation: "UPDATE",
-            fieldChanges: [{ field: "CD_isHidden", operation: "ADD" }],
-          },
-          {
-            recordType: "CD_Waypoint",
-            operation: "UPDATE",
-            fieldChanges: [{ field: "CD_isHidden", operation: "ADD" }],
-          },
-        ],
+  // `…/schema/diff` refuses a management token, so the diff is computed here
+  // from the two environments' schemas, both of which the token can read.
+  it("reads both environments and reports a new field once per record type", async () => {
+    const fetchImpl = schemas(
+      schemaResponse("dev", {
+        CD_Track: { ...TRACK, CD_isHidden: { type: "int64Type" } },
+        CD_Waypoint: { CD_isHidden: { type: "int64Type" } },
       }),
+      schemaResponse("prod", { CD_Track: TRACK, CD_Waypoint: {} }),
     );
     const harness = await connectConfigured({ CLOUDKIT_CONTAINER_ID: "C" }, fetchImpl);
     const body = await harness.call("cloudkit_diff_schema");
@@ -203,52 +275,99 @@ describe("cloudkit_diff_schema", () => {
         { operation: "ADD", recordType: "CD_Waypoint", field: "CD_isHidden" },
       ],
     });
+    const urls = fetchImpl.mock.calls.map(([url]) => String(url));
+    expect(urls.some((u) => u.endsWith("/DEVELOPMENT/schema"))).toBe(true);
+    expect(urls.some((u) => u.endsWith("/PRODUCTION/schema"))).toBe(true);
+    expect(urls.some((u) => u.includes("/schema/diff"))).toBe(false);
   });
 
   it("reports a whole new record type as a single row", async () => {
-    const fetchImpl = vi.fn(async () =>
-      jsonResponse({ recordTypeChanges: [{ recordType: "CD_Layer", operation: "ADD" }] }),
+    const fetchImpl = schemas(
+      schemaResponse("dev", { CD_Track: TRACK, CD_Layer: { CD_name: {} } }),
+      schemaResponse("prod", { CD_Track: TRACK }),
     );
     const harness = await connectConfigured({ CLOUDKIT_CONTAINER_ID: "C" }, fetchImpl);
     const body = await harness.call("cloudkit_diff_schema");
     expect(body).toMatchObject({ changes: [{ operation: "ADD", recordType: "CD_Layer" }] });
+    expect((body.changes as unknown[]).length).toBe(1);
   });
 
-  it("distinguishes an empty diff from an unreadable one", async () => {
-    const empty = vi.fn(async () => jsonResponse({ recordTypeChanges: [] }));
-    const emptyBody = await (
-      await connectConfigured({ CLOUDKIT_CONTAINER_ID: "C" }, empty)
-    ).call("cloudkit_diff_schema");
-    expect(emptyBody).toMatchObject({ changes: [] });
+  it("names a retype, an index change and a field Production has but Development lacks", async () => {
+    const fetchImpl = schemas(
+      schemaResponse("dev", {
+        CD_Track: {
+          CD_name: { indexes: ["QUERYABLE", "SEARCHABLE", "SORTABLE"] },
+          CD_index: { type: "doubleType" },
+        },
+      }),
+      schemaResponse("prod", {
+        CD_Track: {
+          CD_name: { indexes: ["QUERYABLE", "SORTABLE"] },
+          CD_index: { type: "int64Type" },
+          CD_legacy: {},
+        },
+      }),
+    );
+    const harness = await connectConfigured({ CLOUDKIT_CONTAINER_ID: "C" }, fetchImpl);
+    const body = await harness.call("cloudkit_diff_schema");
 
-    const unknown = vi.fn(async () => jsonResponse({ delta: "surprise" }));
-    const unknownBody = await (
-      await connectConfigured({ CLOUDKIT_CONTAINER_ID: "C" }, unknown)
-    ).call("cloudkit_diff_schema");
-    expect(unknownBody).toMatchObject({ delta: "surprise" });
+    expect(body).toMatchObject({
+      changes: [
+        {
+          operation: "CHANGE_INDEXES",
+          recordType: "CD_Track",
+          field: "CD_name",
+          detail: "QUERYABLE SORTABLE → QUERYABLE SEARCHABLE SORTABLE",
+        },
+        {
+          operation: "RETYPE",
+          recordType: "CD_Track",
+          field: "CD_index",
+          detail: "int64Type → doubleType",
+        },
+        { operation: "MISSING_IN_DEVELOPMENT", recordType: "CD_Track", field: "CD_legacy" },
+      ],
+    });
+  });
+
+  it("reports an empty diff when the environments agree", async () => {
+    const same = schemaResponse("x", { CD_Track: TRACK }, "DEFINE SCHEMA same");
+    const fetchImpl = schemas(same, same);
+    const harness = await connectConfigured({ CLOUDKIT_CONTAINER_ID: "C" }, fetchImpl);
+    expect(await harness.call("cloudkit_diff_schema")).toMatchObject({ changes: [] });
+  });
+
+  it("never calls a differing schema empty, even when no field moved", async () => {
+    // Permissions (GRANT lines) are not modelled field by field, but they deploy.
+    const fetchImpl = schemas(
+      schemaResponse("dev", { CD_Track: TRACK }, 'DEFINE SCHEMA … GRANT READ TO "_world"'),
+      schemaResponse("prod", { CD_Track: TRACK }, "DEFINE SCHEMA …"),
+    );
+    const harness = await connectConfigured({ CLOUDKIT_CONTAINER_ID: "C" }, fetchImpl);
+    expect(await harness.call("cloudkit_diff_schema")).toMatchObject({
+      changes: [{ operation: "OTHER" }],
+    });
+  });
+
+  it("hands back both raw schemas when either envelope is unrecognised", async () => {
+    const fetchImpl = schemas({ delta: "surprise" }, schemaResponse("prod", {}));
+    const harness = await connectConfigured({ CLOUDKIT_CONTAINER_ID: "C" }, fetchImpl);
+    const body = await harness.call("cloudkit_diff_schema");
+    expect(body).toMatchObject({ development: { delta: "surprise" } });
+    expect(body.changes).toBeUndefined();
   });
 });
 
-/** Stubs the diff read every cloudkit_deploy_schema call makes first, then delegates. */
-const diffThen = (rest: (url: string) => Response) =>
-  vi.fn(async (url: string, _init?: RequestInit) => {
-    if (url.endsWith("/schema/diff")) {
-      return jsonResponse({
-        recordTypeChanges: [
-          {
-            recordType: "CD_Track",
-            operation: "UPDATE",
-            fieldChanges: [{ field: "CD_isHidden", operation: "ADD" }],
-          },
-        ],
-      });
-    }
-    return rest(url);
-  });
+/** A Development schema one field ahead of Production. */
+const pending = () =>
+  schemas(
+    schemaResponse("dev-uuid-1", { CD_Track: { ...TRACK, CD_isHidden: { type: "int64Type" } } }),
+    schemaResponse("prod-uuid", { CD_Track: TRACK }),
+  );
 
 describe("cloudkit_deploy_schema", () => {
   it("returns the diff and promotes nothing on a dry run", async () => {
-    const fetchImpl = diffThen(() => jsonResponse({}));
+    const fetchImpl = pending();
     const harness = await connectWithWrites({ CLOUDKIT_CONTAINER_ID: "C" }, fetchImpl);
     const body = (await harness.call("cloudkit_deploy_schema", {
       confirm: true,
@@ -263,7 +382,7 @@ describe("cloudkit_deploy_schema", () => {
   });
 
   it("refuses without confirm", async () => {
-    const fetchImpl = diffThen(() => jsonResponse({}));
+    const fetchImpl = pending();
     const harness = await connectWithWrites({ CLOUDKIT_CONTAINER_ID: "C" }, fetchImpl);
     const result = await harness.call("cloudkit_deploy_schema", {});
     expect(result.isToolError).toBe(true);
@@ -271,9 +390,8 @@ describe("cloudkit_deploy_schema", () => {
   });
 
   it("refuses when there is nothing to deploy", async () => {
-    const fetchImpl = vi.fn(async (_url: string, _init?: RequestInit) =>
-      jsonResponse({ recordTypeChanges: [] }),
-    );
+    const same = schemaResponse("x", { CD_Track: TRACK }, "same");
+    const fetchImpl = schemas(same, same);
     const harness = await connectWithWrites({ CLOUDKIT_CONTAINER_ID: "C" }, fetchImpl);
     const result = await harness.call("cloudkit_deploy_schema", { confirm: true });
 
@@ -282,12 +400,40 @@ describe("cloudkit_deploy_schema", () => {
     expect(fetchImpl.mock.calls.every(([url]) => !String(url).includes("/promote"))).toBe(true);
   });
 
-  it("promotes the development schema uuid read off the container", async () => {
-    const fetchImpl = diffThen((url) =>
-      url.endsWith("/containers/iCloud.io.mgcrea.Balise")
-        ? jsonResponse({ developmentSchemaUUID: "dev-uuid-1", productionSchemaUUID: "prod-uuid" })
-        : jsonResponse({ ok: true }),
+  it("does not count fields only Production has as something to deploy", async () => {
+    const fetchImpl = schemas(
+      schemaResponse("dev", { CD_Track: TRACK }, "same"),
+      schemaResponse("prod", { CD_Track: { ...TRACK, CD_legacy: {} } }, "same"),
     );
+    const harness = await connectWithWrites({ CLOUDKIT_CONTAINER_ID: "C" }, fetchImpl);
+    const result = await harness.call("cloudkit_deploy_schema", { confirm: true });
+    expect(result.error).toContain("Nothing to deploy");
+  });
+
+  it("refuses a retype, which Production can never accept", async () => {
+    const fetchImpl = schemas(
+      schemaResponse("dev", { CD_Track: { CD_index: { type: "doubleType" } } }),
+      schemaResponse("prod", { CD_Track: { CD_index: { type: "int64Type" } } }),
+    );
+    const harness = await connectWithWrites({ CLOUDKIT_CONTAINER_ID: "C" }, fetchImpl);
+    const result = await harness.call("cloudkit_deploy_schema", { confirm: true });
+
+    expect(result.isToolError).toBe(true);
+    expect(result.error).toContain("RETYPE");
+    expect(fetchImpl.mock.calls.every(([url]) => !String(url).includes("/promote"))).toBe(true);
+  });
+
+  it("refuses when the schemas cannot be read, rather than deploying blind", async () => {
+    const fetchImpl = schemas({ delta: "surprise" }, schemaResponse("prod", {}));
+    const harness = await connectWithWrites({ CLOUDKIT_CONTAINER_ID: "C" }, fetchImpl);
+    const result = await harness.call("cloudkit_deploy_schema", { confirm: true });
+
+    expect(result.isToolError).toBe(true);
+    expect(fetchImpl.mock.calls.every(([url]) => !String(url).includes("/promote"))).toBe(true);
+  });
+
+  it("promotes the development schema's own uuid", async () => {
+    const fetchImpl = pending();
     const harness = await connectWithWrites(
       { CLOUDKIT_CONTAINER_ID: "iCloud.io.mgcrea.Balise" },
       fetchImpl,
@@ -308,13 +454,71 @@ describe("cloudkit_deploy_schema", () => {
     expect((promote?.[1] as RequestInit | undefined)?.method).toBe("POST");
   });
 
-  it("names both paths it looked in when the schema uuid is nowhere", async () => {
-    const fetchImpl = diffThen(() => jsonResponse({ noUuidHere: true }));
+  it("explains a refused promote and still returns the diff it would have deployed", async () => {
+    const fetchImpl = schemas(
+      schemaResponse("dev-uuid-1", { CD_Track: { ...TRACK, CD_isHidden: {} } }),
+      schemaResponse("prod-uuid", { CD_Track: TRACK }),
+      () => jsonResponse({ code: 401, message: "authentication-failed" }, { status: 401 }),
+    );
     const harness = await connectWithWrites({ CLOUDKIT_CONTAINER_ID: "C" }, fetchImpl);
     const result = await harness.call("cloudkit_deploy_schema", { confirm: true });
 
     expect(result.isToolError).toBe(true);
-    expect(result.error).toContain("development schema UUID");
+    expect(result.error).toContain("CloudKit Console");
+    expect(result.details).toMatchObject({
+      status: 401,
+      changes: [{ operation: "ADD", recordType: "CD_Track", field: "CD_isHidden" }],
+    });
+  });
+});
+
+/** Writes a `.ckdb` to a fresh temp dir and returns its path. */
+const ckdbFile = (text = "DEFINE SCHEMA\n"): string => {
+  const path = join(mkdtempSync(join(tmpdir(), "cloudkit-test-")), "dev.ckdb");
+  writeFileSync(path, text, "utf8");
+  return path;
+};
+
+/** The single `file` part of a multipart body, as cktool sends it. */
+const filePartOf = (init: RequestInit): File => {
+  expect(init.body).toBeInstanceOf(FormData);
+  const part = (init.body as FormData).get("file");
+  expect(part).toBeInstanceOf(File);
+  return part as File;
+};
+
+// Both read out of a live cktool session: the schema goes up as one multipart
+// part named `file`, and a `text/plain` body is refused with 415.
+describe("schema uploads", () => {
+  it("validates with a POST of the file as a multipart part", async () => {
+    const fetchImpl = vi.fn(async () => jsonResponse({}));
+    const harness = await connectConfigured({ CLOUDKIT_CONTAINER_ID: "C" }, fetchImpl);
+    const filePath = ckdbFile("DEFINE SCHEMA\n    RECORD TYPE CD_Track ();\n");
+    await harness.call("cloudkit_validate_schema", { environment: "DEVELOPMENT", filePath });
+
+    expect(harness.urlAt()).toContain("/environments/DEVELOPMENT/schema/validate");
+    const init = harness.initAt();
+    expect(init.method).toBe("POST");
+    // fetch writes the multipart Content-Type, boundary included; a hand-set one would lack it.
+    expect((init.headers as Record<string, string>)["Content-Type"]).toBeUndefined();
+    const part = filePartOf(init);
+    expect(part.name).toBe("dev.ckdb");
+    expect(await part.text()).toBe("DEFINE SCHEMA\n    RECORD TYPE CD_Track ();\n");
+  });
+
+  it("imports with a PUT to the environment schema, not a POST", async () => {
+    const fetchImpl = vi.fn(async () => jsonResponse({}));
+    const harness = await connectWithWrites({ CLOUDKIT_CONTAINER_ID: "C" }, fetchImpl);
+    await harness.call("cloudkit_import_schema", {
+      environment: "DEVELOPMENT",
+      filePath: ckdbFile(),
+      confirm: true,
+    });
+
+    expect(harness.urlAt()).toMatch(/\/environments\/DEVELOPMENT\/schema$/);
+    const init = harness.initAt();
+    expect(init.method).toBe("PUT");
+    expect(await filePartOf(init).text()).toBe("DEFINE SCHEMA\n");
   });
 });
 
@@ -365,6 +569,22 @@ describe("cloudkit_request", () => {
       confirm: true,
       path: "/v1/database/teams/T/containers/C/environments/DEVELOPMENT/reset",
     });
+
+    expect(result.isToolError).toBe(true);
+    expect(result.error).toContain("deletes all data");
+    expect(fetchImpl).not.toHaveBeenCalled();
+  });
+
+  it.each([
+    ["a capitalised segment", "/v1/database/teams/T/containers/C/environments/DEVELOPMENT/Reset"],
+    [
+      "a percent-encoded segment",
+      "/v1/database/teams/T/containers/C/environments/DEVELOPMENT/%72eset",
+    ],
+  ])("refuses the reset route spelled with %s", async (_label, path) => {
+    const fetchImpl = vi.fn(async () => jsonResponse({}));
+    const harness = await connectWithWrites({}, fetchImpl);
+    const result = await harness.call("cloudkit_request", { method: "POST", confirm: true, path });
 
     expect(result.isToolError).toBe(true);
     expect(result.error).toContain("deletes all data");

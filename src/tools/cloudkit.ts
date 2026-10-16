@@ -1,14 +1,11 @@
 import { readFileSync, writeFileSync } from "node:fs";
-import { resolve } from "node:path";
+import { basename, resolve } from "node:path";
 
 import type { McpServer } from "@modelcontextprotocol/server";
 import { z } from "zod";
 
 import {
-  containerPath,
   containersPath,
-  recordTypesPath,
-  schemaDiffPath,
   schemaExportPath,
   schemaPath,
   schemaPromotePath,
@@ -16,11 +13,13 @@ import {
   type CloudKitClient,
   type CloudKitEnvironment,
 } from "#/client/cloudkit";
+import { CloudKitApiError } from "#/client/errors";
 import {
-  developmentSchemaUuidOf,
-  recordTypesOf,
+  diffSchemas,
+  isDeployable,
+  schemaRecordTypesOf,
+  schemaUuidOf,
   summarizeRecordType,
-  summarizeSchemaDiff,
 } from "#/client/shape";
 import { confirmArg, dryRunArg, okText, PreconditionError, wrap, wrapResult } from "#/tools/util";
 
@@ -113,16 +112,14 @@ export const registerCloudKitTools = (
     async ({ environment, containerId, recordType }) =>
       wrap(async () => {
         const raw = await client.get(
-          recordTypesPath(teamId, container(containerId), environment as CloudKitEnvironment),
+          schemaPath(teamId, container(containerId), environment as CloudKitEnvironment),
         );
-        const types = recordTypesOf(raw);
+        const types = schemaRecordTypesOf(raw);
         if (!types) return raw;
-        const shaped = types.map(summarizeRecordType);
-        if (!recordType) return { recordTypes: shaped };
         return {
-          recordTypes: shaped.filter(
-            (t) => t && typeof t === "object" && (t as { name?: unknown }).name === recordType,
-          ),
+          recordTypes: types
+            .filter((type) => !recordType || type.recordTypeName === recordType)
+            .map(summarizeRecordType),
         };
       }),
   );
@@ -164,20 +161,20 @@ export const registerCloudKitTools = (
       title: "CloudKit: Diff Schema",
       description:
         "Show what deploying would change: the pending differences between the container's " +
-        "DEVELOPMENT and PRODUCTION schemas, one row per change. Read this before " +
+        "DEVELOPMENT and PRODUCTION schemas, one row per change: ADD, CHANGE_INDEXES, RETYPE, " +
+        "MISSING_IN_DEVELOPMENT (Production keeps it; a deploy cannot remove it) or OTHER " +
+        "(the schemas differ outside any field, e.g. permissions). Read this before " +
         "cloudkit_deploy_schema. Production is additive-only and irreversible — a field can be " +
-        "added forever, but never removed, renamed or retyped — so a diff proposing anything " +
-        "other than additions is a reason to stop.",
+        "added forever, but never removed, renamed or retyped — so a RETYPE is a reason to stop.",
       inputSchema: z.object({ containerId: containerArg }),
       annotations: { readOnlyHint: true },
     },
     async ({ containerId }) =>
       wrap(async () => {
-        const raw = await client.get(schemaDiffPath(teamId, container(containerId)));
-        const changes = summarizeSchemaDiff(raw);
-        // `undefined` means the envelope was not recognised, which is not the
+        const { development, production, changes } = await readDiff(container(containerId));
+        // `undefined` means an envelope was not recognised, which is not the
         // same as "no changes" and must not be reported as it.
-        return changes ? { changes } : raw;
+        return changes ? { changes } : { development, production };
       }),
   );
 
@@ -200,7 +197,7 @@ export const registerCloudKitTools = (
         client.request(
           "POST",
           schemaValidatePath(teamId, container(containerId), environment as CloudKitEnvironment),
-          { text: readSchemaFile(filePath) },
+          { file: readSchemaFile(filePath) },
         ),
       ),
   );
@@ -226,7 +223,7 @@ export const registerCloudKitTools = (
           .min(1)
           .describe(
             "Absolute API path, e.g. " +
-              '"/v1/database/teams/{teamId}/containers/{containerId}/environments/DEVELOPMENT/recordTypes".',
+              '"/v1/database/teams/{teamId}/containers/{containerId}/environments/DEVELOPMENT/schema".',
           ),
         body: z.record(z.string(), z.unknown()).optional().describe("JSON request body."),
         confirm: z
@@ -260,10 +257,11 @@ export const registerCloudKitTools = (
       description:
         "Promote the container's DEVELOPMENT schema to PRODUCTION — the API behind the Console's " +
         "Deploy Schema Changes button. **Irreversible and additive-only**: after this you can add " +
-        "fields forever but never remove, rename or retype one. Always fetches and returns the " +
-        "diff first, and refuses when there is nothing to deploy. Run with dryRun to see the " +
-        "diff without committing. Deploy before shipping the build that uses a new field, not " +
-        "after: a client cannot alter the Production schema and does not report that it did nothing.",
+        "fields forever but never remove, rename or retype one. Always computes and returns the " +
+        "diff first, and refuses when there is nothing to deploy, when a field is retyped, or " +
+        "when either schema cannot be read. Run with dryRun to see the diff without committing. " +
+        "Deploy before shipping the build that uses a new field, not after: a client cannot " +
+        "alter the Production schema and does not report that it did nothing.",
       inputSchema: z.object({
         containerId: containerArg,
         confirm: confirmArg,
@@ -274,20 +272,57 @@ export const registerCloudKitTools = (
     async ({ containerId, dryRun }) =>
       wrap(async () => {
         const id = container(containerId);
-        const raw = await client.get(schemaDiffPath(teamId, id));
-        const changes = summarizeSchemaDiff(raw);
+        const { development, production, changes } = await readDiff(id);
 
-        if (changes && changes.length === 0) {
+        // Unlike the read-only diff, a deploy cannot fall back to the raw
+        // payloads: the whole point of reading first is to know what it does.
+        if (!changes) {
+          throw new PreconditionError(
+            "Could not read the schemas to diff, so nothing was deployed. Deploy from the " +
+              "CloudKit Console, which shows its own diff first.",
+            { containerId: id, development, production },
+          );
+        }
+        const retyped = changes.filter((change) => change.operation === "RETYPE");
+        if (retyped.length > 0) {
+          throw new PreconditionError(
+            "Refusing to deploy a RETYPE: Production can never change a field's type. " +
+              "Add a new field instead.",
+            { containerId: id, changes: retyped },
+          );
+        }
+        if (!changes.some(isDeployable)) {
           throw new PreconditionError("Nothing to deploy: DEVELOPMENT and PRODUCTION agree.", {
             containerId: id,
+            changes,
           });
         }
-        const diff = changes ?? raw;
-        if (dryRun) return { dryRun: true, containerId: id, wouldDeploy: diff };
+        if (dryRun) return { dryRun: true, containerId: id, wouldDeploy: changes };
 
-        const schemaUuid = await developmentSchemaUuid(id);
-        const result = await client.post(schemaPromotePath(teamId, id, schemaUuid));
-        return { deployed: true, containerId: id, schemaUuid, changes: diff, result };
+        const schemaUuid = schemaUuidOf(development);
+        if (!schemaUuid) {
+          throw new PreconditionError("The DEVELOPMENT schema carries no uuid to promote.", {
+            containerId: id,
+            hint: "Inspect …/environments/DEVELOPMENT/schema with cloudkit_request.",
+          });
+        }
+        try {
+          const result = await client.post(schemaPromotePath(teamId, id, schemaUuid));
+          return { deployed: true, containerId: id, schemaUuid, changes, result };
+        } catch (err) {
+          // The promote route has not yet been seen to accept a management
+          // token; diff and recordTypes, its neighbours, do not. If it refuses,
+          // say so plainly and hand back the diff the Console will show.
+          if (err instanceof CloudKitApiError && (err.status === 401 || err.status === 403)) {
+            throw new PreconditionError(
+              "CloudKit refused the promote with this management token, so nothing was " +
+                "deployed. Use Deploy Schema Changes in the CloudKit Console; it will show " +
+                "these changes.",
+              { status: err.status, detail: err.detail, containerId: id, schemaUuid, changes },
+            );
+          }
+          throw err;
+        }
       }),
   );
 
@@ -311,34 +346,23 @@ export const registerCloudKitTools = (
     async ({ environment, containerId, filePath }) =>
       wrap(async () =>
         client.request(
-          "POST",
+          "PUT",
           schemaPath(teamId, container(containerId), environment as CloudKitEnvironment),
-          { text: readSchemaFile(filePath) },
+          { file: readSchemaFile(filePath) },
         ),
       ),
   );
 
   /**
-   * The UUID `promote` takes. Tried in two places because the container response
-   * and the environment schema response are near-identical envelopes and which
-   * one carries it is not documented — failing with both paths named beats
-   * failing with a 404 on a URL the caller never composed.
+   * Both environments' schemas and the changes between them. The API's own
+   * `…/schema/diff` refuses a management token; the schemas do not.
    */
-  async function developmentSchemaUuid(containerId: string): Promise<string> {
-    const fromContainer = developmentSchemaUuidOf(
-      await client.get(containerPath(teamId, containerId)),
-    );
-    if (fromContainer) return fromContainer;
-
-    const fromSchema = developmentSchemaUuidOf(
-      await client.get(schemaPath(teamId, containerId, "DEVELOPMENT")),
-    );
-    if (fromSchema) return fromSchema;
-
-    throw new PreconditionError("Could not find the development schema UUID to promote.", {
-      looked: [containerPath(teamId, containerId), schemaPath(teamId, containerId, "DEVELOPMENT")],
-      hint: "Inspect those two paths with cloudkit_request to see where the UUID lives.",
-    });
+  async function readDiff(containerId: string) {
+    const [development, production] = await Promise.all([
+      client.get(schemaPath(teamId, containerId, "DEVELOPMENT")),
+      client.get(schemaPath(teamId, containerId, "PRODUCTION")),
+    ]);
+    return { development, production, changes: diffSchemas(development, production) };
   }
 };
 
@@ -352,7 +376,9 @@ export const registerCloudKitTools = (
  * one route deliberately left out, which is worse than never having omitted it.
  */
 const assertNotDestructive = (path: string): void => {
-  if (/\/environments\/[^/]+\/reset\b/.test(path)) {
+  // Matched on the path as the server will read it: decoded once, any case.
+  // Otherwise `…/Reset` or `…/%72eset` would walk past a check on the raw text.
+  if (/\/environments\/[^/]+\/reset\b/i.test(decodedPath(path))) {
     throw new PreconditionError(
       "Refusing to call the container reset endpoint: it deletes all data in the " +
         "development environment. Use the CloudKit Console if you genuinely mean to.",
@@ -361,11 +387,19 @@ const assertNotDestructive = (path: string): void => {
   }
 };
 
+const decodedPath = (path: string): string => {
+  try {
+    return decodeURIComponent(path);
+  } catch {
+    return path;
+  }
+};
+
 /** Read a `.ckdb`, naming the resolved path so a wrong relative path is obvious. */
-const readSchemaFile = (filePath: string): string => {
+const readSchemaFile = (filePath: string): { name: string; content: string } => {
   const path = resolve(filePath);
   try {
-    return readFileSync(path, "utf8");
+    return { name: basename(path), content: readFileSync(path, "utf8") };
   } catch (err) {
     throw new PreconditionError(`Could not read the schema file (${path}).`, {
       cause: err instanceof Error ? err.message : String(err),

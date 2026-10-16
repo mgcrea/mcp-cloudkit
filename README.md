@@ -30,32 +30,51 @@ you before you press the button.
 
 ## The API is undocumented
 
-Apple ships no public docs or OpenAPI spec for the CloudKit management API. Every route here was
-read out of the `cktool` binary Xcode installs (`strings $(xcrun -f cktool)`), which is a thin
-client over exactly this API at `https://api.icloud.apple.com` with an
-`X-Apple-CloudKit-User-Token` header. `cktool`'s own CLI exposes `export-schema`,
-`import-schema` and `validate-schema` — but **not** the diff-then-promote pair the Console
-actually uses for a deploy, which is why this server exists rather than just wrapping cktool.
+Apple ships no public docs or OpenAPI spec for the CloudKit management API. The routes here were
+read out of the `cktool` binary Xcode installs (`strings $(xcrun -f cktool)`), and the way it calls
+them — headers, methods, bodies — out of a live `cktool` session under a debugger, because
+`strings` alone gets that wrong:
 
-Two consequences follow from that:
+- A management token goes in **`X-ACP-API-TOKEN`**. `X-Apple-CloudKit-User-Token`, the only
+  header name `strings` finds, is for _user_ tokens; a management token sent there gets
+  `401 Failed to validate user token`.
+- Containers are listed at **`/teams/{teamId}/containers`**, the one route outside `/v1/database`.
+- A `.ckdb` goes up as a **multipart** body with one part named `file`, never `text/plain` (415).
+  Validate is a `POST`; import is a `PUT`.
+- The binary also names `…/recordTypes`, `…/containers/{id}` and `…/schema/diff`. They exist, but
+  refuse a management token (`401 authentication-failed`): they belong to the Console's signed-in
+  session. So record types are read from `GET …/environments/{env}/schema`, and the diff is
+  computed here from the two environments' schemas — the same data, reachable with the token.
+
+`cktool`'s own CLI exposes `export-schema`, `import-schema` and `validate-schema` — but **not** a
+diff or a deploy, which is why this server exists rather than just wrapping cktool.
+
+Three consequences follow from that:
 
 - Every response shaper falls back to the **raw payload** when it does not recognise the
   envelope, rather than reporting an empty result. A wrong guess here must never read as "the
   field is not deployed yet" when the truth is "the shaper does not understand this response".
 - `cloudkit_request` is a GET-by-default escape hatch, so one endpoint answering differently than
   expected cannot make the rest of the server useless.
+- **`cloudkit_deploy_schema` has not yet been seen to work with a management token.** Its
+  `…/schema/{uuid}/promote` route comes from the binary like the rest, but `cktool` never calls
+  it, and its Console-only neighbours refuse the token. If it is refused, the tool says so and
+  returns the diff; deploy from the Console instead.
 
 ## Features
 
-- **`cloudkit_diff_schema`** shows exactly what a deploy would change, one row per record type or
-  field. **`cloudkit_deploy_schema`** always fetches that diff first, refuses when there is
-  nothing to deploy, and takes `dryRun` to stop before committing.
+- **`cloudkit_diff_schema`** shows what a deploy would change, one row per record type or field:
+  `ADD`, `CHANGE_INDEXES`, `RETYPE`, `MISSING_IN_DEVELOPMENT` (Production keeps it; a deploy
+  cannot remove it), or `OTHER` when the schemas differ outside any field, such as permissions.
+  **`cloudkit_deploy_schema`** always computes that diff first; it refuses when there is nothing
+  to deploy, when a field is retyped, or when either schema cannot be read, and takes `dryRun` to
+  stop before committing.
 - **`cloudkit_list_record_types`** answers "did my new field actually reach CloudKit" in one
   call — Core Data and SwiftData prefix every record type and field with `CD_`, so a Swift
   `isHidden` on `Track` shows up as `CD_isHidden` on `CD_Track`.
 - The container `reset` route (wipes all Development data) is **not exposed as a tool**, and
-  `cloudkit_request` refuses to reach it by path — omitting it as a tool would mean little if the
-  escape hatch could still call it.
+  `cloudkit_request` refuses to reach it by path, in any case and percent-encoded or not —
+  omitting it as a tool would mean little if the escape hatch could still call it.
 
 ## Security
 

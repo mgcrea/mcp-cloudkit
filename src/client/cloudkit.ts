@@ -17,8 +17,11 @@ export type CloudKitClientOptions = {
 export type CloudKitRequestOptions = {
   query?: Query;
   body?: unknown;
-  /** Sent verbatim as the request body, for the `.ckdb` schema uploads. */
-  text?: string;
+  /**
+   * A `.ckdb` upload, sent the way cktool sends one: a multipart body with a
+   * single part named `file`. A `text/plain` body is refused with 415.
+   */
+  file?: { name: string; content: string };
   accept?: string;
 };
 
@@ -82,21 +85,39 @@ export class CloudKitClient {
   ): Promise<Response> {
     const url = `${this.baseUrl}${path}${buildQuery(opts.query)}`;
     const hasJson = opts.body !== undefined;
-    const hasText = opts.text !== undefined;
+    // Built per attempt: a FormData body is consumed by the request that sends it.
+    const form = (): FormData | undefined => {
+      if (!opts.file) return undefined;
+      const data = new FormData();
+      data.append(
+        "file",
+        new Blob([opts.file.content], { type: "application/octet-stream" }),
+        opts.file.name,
+      );
+      return data;
+    };
 
     return withRetry(
       () =>
         this.fetchImpl(url, {
           method,
+          // X-ACP-API-TOKEN is what cktool sends a management token in, read off
+          // a live session under a debugger — the name never appears in the
+          // binary's `strings`. X-Apple-CloudKit-User-Token, which does, is for
+          // *user* tokens: a management token sent there gets 401 "Failed to
+          // validate user token". X-CK-CLIENT is not checked; cktool sends its
+          // own name and version, so this sends ours.
           headers: {
             Accept: opts.accept ?? "application/json",
-            "X-Apple-CloudKit-User-Token": this.token,
+            "X-ACP-API-TOKEN": this.token,
+            "X-CK-CLIENT": this.userAgent,
             "User-Agent": this.userAgent,
+            // No Content-Type for a file: fetch writes the multipart one,
+            // boundary included, from the FormData body.
             ...(hasJson ? { "Content-Type": "application/json" } : {}),
-            ...(hasText ? { "Content-Type": "text/plain" } : {}),
           },
           ...(hasJson ? { body: JSON.stringify(opts.body) } : {}),
-          ...(hasText ? { body: opts.text } : {}),
+          ...(opts.file ? { body: form() } : {}),
         }),
       { maxRetries: this.maxRetries, label: `${method} ${url}`, logger: this.logger },
     );
@@ -166,41 +187,24 @@ export class CloudKitClient {
 // Spelled out rather than interpolated at each call site: the paths are long,
 // nearly identical, and the difference that matters — team-scoped vs
 // environment-scoped — is invisible in a template literal three lines wide.
+//
+// Only routes a management token can reach are built here. The binary also
+// names `…/recordTypes`, `…/containers/{id}` and `…/schema/diff`; they exist,
+// but answer a management token with 401 "authentication-failed" — they are
+// the Console's, behind a signed-in session. cktool never calls them either.
 
-/** Containers visible to a team. */
+/** Containers visible to a team. The one route that is not under `/v1/database`. */
 export const containersPath = (teamId: string): string =>
-  `/v1/database/teams/${encodeURIComponent(teamId)}/containers`;
+  `/teams/${encodeURIComponent(teamId)}/containers`;
 
-/** One container, which is where the schema UUIDs live. */
-export const containerPath = (teamId: string, containerId: string): string =>
-  `${containersPath(teamId)}/${encodeURIComponent(containerId)}`;
+const containerPath = (teamId: string, containerId: string): string =>
+  `/v1/database/teams/${encodeURIComponent(teamId)}/containers/${encodeURIComponent(containerId)}`;
 
 const environmentPath = (
   teamId: string,
   containerId: string,
   environment: CloudKitEnvironment,
 ): string => `${containerPath(teamId, containerId)}/environments/${environment}`;
-
-export const recordTypesPath = (
-  teamId: string,
-  containerId: string,
-  environment: CloudKitEnvironment,
-): string => `${environmentPath(teamId, containerId, environment)}/recordTypes`;
-
-export const recordTypePath = (
-  teamId: string,
-  containerId: string,
-  environment: CloudKitEnvironment,
-  recordType: string,
-): string =>
-  `${recordTypesPath(teamId, containerId, environment)}/${encodeURIComponent(recordType)}`;
-
-export const recordTypeFieldsPath = (
-  teamId: string,
-  containerId: string,
-  environment: CloudKitEnvironment,
-  recordType: string,
-): string => `${recordTypePath(teamId, containerId, environment, recordType)}/fields`;
 
 /** The environment's schema as a `.ckdb` document. */
 export const schemaExportPath = (
@@ -209,7 +213,11 @@ export const schemaExportPath = (
   environment: CloudKitEnvironment,
 ): string => `${environmentPath(teamId, containerId, environment)}/schema/export`;
 
-/** GET reads the schema record (and its UUID); POST imports a `.ckdb`. */
+/**
+ * GET reads the schema record — its `uuid`, the `.ckdb` as `textSchema`, and
+ * every record type and field — so it carries what the Console-only routes
+ * would. PUT imports a `.ckdb` (cktool's own method; not POST).
+ */
 export const schemaPath = (
   teamId: string,
   containerId: string,
@@ -222,11 +230,10 @@ export const schemaValidatePath = (
   environment: CloudKitEnvironment,
 ): string => `${schemaPath(teamId, containerId, environment)}/validate`;
 
-/** Development against Production — what the Console shows before deploying. */
-export const schemaDiffPath = (teamId: string, containerId: string): string =>
-  `${containerPath(teamId, containerId)}/schema/diff`;
-
-/** Deploy: promote a schema UUID to Production. Irreversible and additive-only. */
+/**
+ * Deploy: promote a schema UUID to Production. Irreversible and additive-only.
+ * Not yet seen to accept a management token — see cloudkit_deploy_schema.
+ */
 export const schemaPromotePath = (
   teamId: string,
   containerId: string,
